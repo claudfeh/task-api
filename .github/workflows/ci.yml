@@ -1,0 +1,107 @@
+name: CI
+
+# When this pipeline runs: every push to main, and every pull request
+# targeting main. PRs get tested but their images are NOT published.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+# If you push twice in a row, cancel the older run — only the latest
+# commit matters. Saves runner minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}   # -> ghcr.io/<owner>/task-api
+
+jobs:
+  # ------------------------------------------------------------------
+  # Job 1: test — prove the app actually works before we ship an image
+  # ------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r app/requirements.txt
+
+      - name: Compile check
+        run: python -m py_compile app/app.py
+
+      - name: Boot the full stack
+        run: |
+          cp .env.example .env
+          docker compose up --build -d
+
+      - name: Smoke test the API
+        run: |
+          for i in $(seq 1 12); do
+            curl -fs http://localhost:8080/health && break
+            sleep 5
+          done
+          curl -fs http://localhost:8080/health
+          curl -fs http://localhost:8080/api/tasks | grep -q "Deploy this app"
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # ------------------------------------------------------------------
+  # Job 2: build-and-push — build the image and publish it to GHCR.
+  # Runs only if the tests passed.
+  # ------------------------------------------------------------------
+  build-and-push:
+    name: Build and push image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read    # check out the repo
+      packages: write   # publish to GitHub Container Registry
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
